@@ -61,13 +61,20 @@ final class VisionPipeline: ObservableObject, @unchecked Sendable {
     /// FPS band that keeps the network and thermals happy.
     private let targetInterval: CFTimeInterval = 1.0 / 12.0
 
-    /// Hard cap on points streamed per frame. Keeps each payload in the low-KB
-    /// range regardless of how busy the scene is.
-    private let maxPointsPerFrame = 200
+    /// Hard cap on points streamed per frame. Lower than Phase 2's 200 because
+    /// each point now carries a 121-float patch descriptor (~0.5KB), so this
+    /// keeps payloads in a sane range for the Multipeer link.
+    private let maxPointsPerFrame = 150
 
     /// Vision processes a downscaled copy at this longest-edge size. Smaller =
     /// faster + fewer, cleaner contours. Detail is plenty for sparse features.
     private let maxImageDimension = 512
+
+    /// Half-width of the square patch descriptor. radius 5 → an 11x11 window.
+    private let patchRadius = 5
+
+    /// Side length of the patch (2*radius + 1).
+    private var patchSide: Int { patchRadius * 2 + 1 }
 
     // MARK: Background-confined state (videoQueue only)
 
@@ -121,9 +128,123 @@ final class VisionPipeline: ObservableObject, @unchecked Sendable {
         // --- 3. SAMPLE -------------------------------------------------------
         let points = sampleContourPoints(from: observation)
 
+        // --- 3b. DESCRIBE ----------------------------------------------------
+        // Attach an illumination-invariant patch descriptor to each point so
+        // the peer can match by appearance (Phase 4). Points too close to the
+        // image edge or sitting on a flat/featureless patch are dropped.
+        let (featurePoints, uiPoints) = extractDescriptors(from: pixelBuffer,
+                                                           at: points,
+                                                           width: width,
+                                                           height: height)
+
         // --- 4. DISPATCH -----------------------------------------------------
         frameID &+= 1
-        dispatch(points: points, frameID: frameID, width: width, height: height)
+        dispatch(featurePoints: featurePoints,
+                 uiPoints: uiPoints,
+                 frameID: frameID,
+                 width: width,
+                 height: height)
+    }
+
+    // MARK: Patch descriptors
+
+    /// For each sampled point, reads an 11x11 grayscale patch from the pixel
+    /// buffer and normalizes it (zero mean, unit std) for lighting invariance.
+    /// Returns the surviving FeaturePoints (with descriptors) and the matching
+    /// CGPoints for the UI overlay, kept in lockstep.
+    ///
+    /// The capture format is 32BGRA (configured in CameraManager), so we derive
+    /// luma per pixel as a weighted sum of the B/G/R bytes.
+    private func extractDescriptors(from pixelBuffer: CVPixelBuffer,
+                                    at points: [CGPoint],
+                                    width: Int,
+                                    height: Int) -> ([FeaturePoint], [CGPoint]) {
+        guard CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA else {
+            // Unexpected format: fall back to descriptor-less points.
+            let fallback = points.map { FeaturePoint(x: Float($0.x), y: Float($0.y)) }
+            return (fallback, points)
+        }
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+            return ([], [])
+        }
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let ptr = base.assumingMemoryBound(to: UInt8.self)
+
+        var featurePoints: [FeaturePoint] = []
+        var uiPoints: [CGPoint] = []
+        featurePoints.reserveCapacity(points.count)
+        uiPoints.reserveCapacity(points.count)
+
+        for p in points {
+            // Vision coords are normalized BOTTOM-LEFT; pixel rows are TOP-LEFT,
+            // so invert Y when indexing into the buffer.
+            let px = Int(Float(p.x) * Float(width))
+            let py = Int((1 - Float(p.y)) * Float(height))
+
+            if let descriptor = patchDescriptor(ptr,
+                                                bytesPerRow: bytesPerRow,
+                                                width: width,
+                                                height: height,
+                                                cx: px,
+                                                cy: py) {
+                featurePoints.append(FeaturePoint(x: Float(p.x),
+                                                  y: Float(p.y),
+                                                  descriptor: descriptor))
+                uiPoints.append(p)
+            }
+        }
+        return (featurePoints, uiPoints)
+    }
+
+    /// Extracts and normalizes a single patch. Returns nil if the patch would
+    /// fall outside the image, or if it's too flat to be discriminative.
+    private func patchDescriptor(_ ptr: UnsafeMutablePointer<UInt8>,
+                                 bytesPerRow: Int,
+                                 width: Int,
+                                 height: Int,
+                                 cx: Int,
+                                 cy: Int) -> [Float]? {
+        let r = patchRadius
+        // Reject points whose window spills past the image border.
+        guard cx - r >= 0, cy - r >= 0, cx + r < width, cy + r < height else {
+            return nil
+        }
+
+        var patch = [Float](repeating: 0, count: patchSide * patchSide)
+        var i = 0
+        for dy in -r...r {
+            let rowBase = (cy + dy) * bytesPerRow
+            for dx in -r...r {
+                let off = rowBase + (cx + dx) * 4 // BGRA → 4 bytes/pixel
+                let b = Float(ptr[off + 0])
+                let g = Float(ptr[off + 1])
+                let red = Float(ptr[off + 2])
+                // Rec.601 luma weights.
+                patch[i] = 0.114 * b + 0.587 * g + 0.299 * red
+                i += 1
+            }
+        }
+
+        // Normalize: subtract mean, divide by standard deviation.
+        let count = Float(patch.count)
+        let mean = patch.reduce(0, +) / count
+        var variance: Float = 0
+        for v in patch {
+            let d = v - mean
+            variance += d * d
+        }
+        variance /= count
+        let std = sqrt(variance)
+        guard std > 1e-5 else { return nil } // flat patch — not discriminative
+
+        for j in 0..<patch.count {
+            patch[j] = (patch[j] - mean) / std
+        }
+        return patch
     }
 
     // MARK: Sampling
@@ -162,13 +283,14 @@ final class VisionPipeline: ObservableObject, @unchecked Sendable {
 
     // MARK: Dispatch (network + UI)
 
-    private func dispatch(points: [CGPoint], frameID: UInt64, width: Int, height: Int) {
+    private func dispatch(featurePoints: [FeaturePoint],
+                          uiPoints: [CGPoint],
+                          frameID: UInt64,
+                          width: Int,
+                          height: Int) {
         // --- Network: build payload and send via the (main-actor) manager ---
-        // Points are mapped to FeaturePoint with an empty descriptor for now;
-        // Phase 3's matcher will fill descriptors in.
-        let featurePoints = points.map {
-            FeaturePoint(x: Float($0.x), y: Float($0.y))
-        }
+        // Each FeaturePoint now carries a normalized 121-float patch descriptor
+        // that the peer's GeometrySolver matches with SSD + Lowe's ratio test.
         let senderName = multipeerManager.localDisplayName // nonisolated read
         let payload = FeaturePayload(
             frameID: frameID,
@@ -186,7 +308,7 @@ final class VisionPipeline: ObservableObject, @unchecked Sendable {
         // --- UI: publish raw normalized points for the live overlay ---
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.localKeypoints = points
+            self.localKeypoints = uiPoints
             self.processedFrameCount &+= 1
         }
     }

@@ -67,13 +67,16 @@ final class MultipeerManager: NSObject, ObservableObject {
     /// Identifies THIS device on the mesh. Uses the device name for readability.
     private let myPeerID: MCPeerID
 
-    /// This device's display name. `nonisolated` because `myPeerID` is an
-    /// immutable `let`, so it's safe to read from background threads (e.g. the
-    /// VisionPipeline assembling a payload off the main actor).
-    nonisolated var localDisplayName: String { myPeerID.displayName }
+    /// This device's display name, cached as a plain (Sendable) String so it can
+    /// be read from background threads — e.g. the VisionPipeline assembling a
+    /// payload off the main actor — without touching main-actor state.
+    nonisolated let localDisplayName: String
 
-    /// The actual data pipe between connected peers.
-    private let session: MCSession
+    /// The actual data pipe between connected peers. `nonisolated(unsafe)`
+    /// because MCSession's methods are documented thread-safe, and the
+    /// MultipeerConnectivity delegate callbacks (which run off the main actor)
+    /// legitimately need to reference it.
+    private nonisolated(unsafe) let session: MCSession
 
     /// Tells nearby devices "I exist and offer this service."
     private let advertiser: MCNearbyServiceAdvertiser
@@ -87,8 +90,10 @@ final class MultipeerManager: NSObject, ObservableObject {
 
     override init() {
         // Use the device name so two phones are easy to tell apart in the UI.
-        let peerID = MCPeerID(displayName: Self.makePeerName())
+        let name = Self.makePeerName()
+        let peerID = MCPeerID(displayName: name)
         self.myPeerID = peerID
+        self.localDisplayName = name
 
         // `.required` enforces TLS-style encryption on the peer link. Good
         // hygiene even on a LAN; the perf cost is negligible for sparse data.
@@ -297,7 +302,7 @@ extension MultipeerManager: MCNearbyServiceBrowserDelegate {
                              withDiscoveryInfo info: [String: String]?) {
         // Deterministic tie-break: only the "smaller" name initiates the invite
         // so both peers don't invite each other and create a connection race.
-        let shouldInvite = myPeerID.displayName < peerID.displayName
+        let shouldInvite = localDisplayName < peerID.displayName
         Task { @MainActor in
             if shouldInvite {
                 self.log.info("Inviting \(peerID.displayName, privacy: .public)")
