@@ -45,6 +45,10 @@ final class VisionPipeline: ObservableObject, @unchecked Sendable {
     /// for confirming the effective FPS during bring-up.
     @Published private(set) var processedFrameCount: Int = 0
 
+    /// The most recent payload we produced & sent. ContentView pairs this with
+    /// the peer's last received payload to drive the GeometrySolver (Phase 5).
+    @Published private(set) var latestPayload: FeaturePayload?
+
     // MARK: Dependencies
 
     /// We push extracted features to the peer through this. It is @MainActor,
@@ -305,10 +309,11 @@ final class VisionPipeline: ObservableObject, @unchecked Sendable {
             self.multipeerManager.send(payload)
         }
 
-        // --- UI: publish raw normalized points for the live overlay ---
+        // --- UI: publish raw normalized points + latest payload ---
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.localKeypoints = uiPoints
+            self.latestPayload = payload
             self.processedFrameCount &+= 1
         }
     }

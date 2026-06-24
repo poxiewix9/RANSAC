@@ -45,7 +45,18 @@ struct FeaturePoint: Codable, Hashable {
 
 /// One frame's worth of features, plus the metadata the solver needs to make
 /// sense of them. This is the unit we serialize and stream over Multipeer.
-struct FeaturePayload: Codable {
+///
+/// `Equatable` is implemented cheaply (identity by sender + frame + timestamp)
+/// so SwiftUI's `.onChange` can detect a freshly received payload without
+/// deep-comparing every descriptor float.
+struct FeaturePayload: Codable, Equatable {
+
+    static func == (lhs: FeaturePayload, rhs: FeaturePayload) -> Bool {
+        lhs.senderName == rhs.senderName
+            && lhs.frameID == rhs.frameID
+            && lhs.timestamp == rhs.timestamp
+    }
+
     /// Schema version so we can evolve the wire format without breaking peers.
     var version: Int
 

@@ -16,11 +16,23 @@
 import SwiftUI
 import UIKit
 import AVFoundation
+import simd
 
 struct ContentView: View {
     @EnvironmentObject private var camera: CameraManager
     @EnvironmentObject private var multipeer: MultipeerManager
     @EnvironmentObject private var vision: VisionPipeline
+
+    /// The latest triangulated 3D structure, rendered by PointCloudView.
+    @State private var triangulatedPoints: [simd_float3] = []
+
+    /// Guards against piling up solves: the peer streams payloads ~12×/sec but a
+    /// full match + RANSAC + triangulation can take longer, so we drop incoming
+    /// triggers while one solve is already running.
+    @State private var isSolving = false
+
+    /// The math engine. Stateless value type, safe to keep as a constant.
+    private let solver = GeometrySolver()
 
     var body: some View {
         ZStack {
@@ -38,9 +50,10 @@ struct ContentView: View {
             }
 
             // --- HUD overlay ---
-            VStack {
+            VStack(spacing: 12) {
                 statusBadge
                 Spacer()
+                pointCloudPanel
                 linkStatsPanel
             }
             .padding()
@@ -61,6 +74,51 @@ struct ContentView: View {
             camera.onFrame = nil
             camera.stopSession()
             multipeer.stop()
+        }
+        // Whenever a fresh payload arrives from the peer, pair it with our
+        // newest local payload and run the full geometry pipeline off-main.
+        .onChange(of: multipeer.lastReceivedPayload) { _, newValue in
+            runSolver(remote: newValue)
+        }
+    }
+
+    // MARK: Solver trigger
+
+    /// Pairs the freshly received remote payload with our latest local payload
+    /// and runs `GeometrySolver.process` on a background queue, publishing the
+    /// resulting 3D points back to SwiftUI on the main thread.
+    private func runSolver(remote: FeaturePayload?) {
+        guard !isSolving,
+              let remote,
+              let local = vision.latestPayload else { return }
+
+        isSolving = true
+        let solver = self.solver
+        DispatchQueue.global(qos: .userInitiated).async {
+            let points3D = solver.process(localPayload: local, remotePayload: remote)
+            DispatchQueue.main.async {
+                self.triangulatedPoints = points3D
+                self.isSolving = false
+            }
+        }
+    }
+
+    // MARK: 3D point-cloud panel
+
+    private var pointCloudPanel: some View {
+        ZStack(alignment: .topLeading) {
+            PointCloudView(points: $triangulatedPoints)
+                .frame(height: 260)
+                .clipShape(RoundedRectangle(cornerRadius: 16))
+
+            Label("3D Cloud · \(triangulatedPoints.count) pts",
+                  systemImage: "cube.transparent")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(.ultraThinMaterial, in: Capsule())
+                .padding(10)
         }
     }
 
