@@ -67,6 +67,11 @@ final class MultipeerManager: NSObject, ObservableObject {
     /// Identifies THIS device on the mesh. Uses the device name for readability.
     private let myPeerID: MCPeerID
 
+    /// This device's display name. `nonisolated` because `myPeerID` is an
+    /// immutable `let`, so it's safe to read from background threads (e.g. the
+    /// VisionPipeline assembling a payload off the main actor).
+    nonisolated var localDisplayName: String { myPeerID.displayName }
+
     /// The actual data pipe between connected peers.
     private let session: MCSession
 

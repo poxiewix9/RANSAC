@@ -20,6 +20,7 @@ import AVFoundation
 struct ContentView: View {
     @EnvironmentObject private var camera: CameraManager
     @EnvironmentObject private var multipeer: MultipeerManager
+    @EnvironmentObject private var vision: VisionPipeline
 
     var body: some View {
         ZStack {
@@ -27,6 +28,11 @@ struct ContentView: View {
             if camera.authorizationStatus == .authorized {
                 CameraPreviewView(session: camera.session)
                     .ignoresSafeArea()
+
+                // --- Live feature scatter-plot, layered over the feed ---
+                keypointOverlay
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
             } else {
                 permissionPlaceholder
             }
@@ -42,12 +48,43 @@ struct ContentView: View {
         // Kick off camera + networking when the screen appears; tear down when
         // it leaves so we release the camera and stop advertising politely.
         .onAppear {
+            // Route every captured frame into the Vision pipeline. This closure
+            // runs on CameraManager's background videoQueue, so the heavy
+            // contour detection never touches the main thread.
+            camera.onFrame = { [weak vision] buffer, time in
+                vision?.process(pixelBuffer: buffer, timestamp: time)
+            }
             camera.startSession()
             multipeer.start()
         }
         .onDisappear {
+            camera.onFrame = nil
             camera.stopSession()
             multipeer.stop()
+        }
+    }
+
+    // MARK: Keypoint scatter overlay
+
+    /// Draws one dot per detected feature point on top of the camera feed.
+    ///
+    /// COORDINATE MAPPING (critical):
+    /// Vision points are normalized 0...1 with the origin at the BOTTOM-LEFT.
+    /// SwiftUI's coordinate space has the origin at the TOP-LEFT. So we map:
+    ///     screenX = point.x * width
+    ///     screenY = (1 - point.y) * height   ← Y is inverted
+    private var keypointOverlay: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let h = geo.size.height
+            ZStack {
+                ForEach(Array(vision.localKeypoints.enumerated()), id: \.offset) { _, p in
+                    Circle()
+                        .fill(Color.green)
+                        .frame(width: 4, height: 4)
+                        .position(x: p.x * w, y: (1 - p.y) * h)
+                }
+            }
         }
     }
 
@@ -97,6 +134,7 @@ struct ContentView: View {
 
             HStack(spacing: 16) {
                 stat("Frames", "\(camera.frameCount)")
+                stat("Points", "\(vision.localKeypoints.count)")
                 stat("Sent", "\(multipeer.sentPayloadCount)")
                 stat("Recv", "\(multipeer.receivedPayloadCount)")
             }
@@ -157,7 +195,9 @@ struct ContentView: View {
 }
 
 #Preview {
-    ContentView()
+    let multipeer = MultipeerManager()
+    return ContentView()
         .environmentObject(CameraManager())
-        .environmentObject(MultipeerManager())
+        .environmentObject(multipeer)
+        .environmentObject(VisionPipeline(multipeerManager: multipeer))
 }
