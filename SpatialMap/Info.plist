@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- ============================================================= -->
+	<!-- CAMERA PERMISSION                                              -->
+	<!-- Required because we open an AVCaptureSession on the rear cam.  -->
+	<!-- Without this string the app crashes the instant it asks for    -->
+	<!-- camera access.                                                 -->
+	<!-- ============================================================= -->
+	<key>NSCameraUsageDescription</key>
+	<string>SpatialMap uses the camera to detect sparse visual features for collaborative 3D mapping. No video ever leaves your device.</string>
+
+	<!-- ============================================================= -->
+	<!-- LOCAL NETWORK PERMISSION (iOS 14+)                             -->
+	<!-- MultipeerConnectivity uses Bonjour + peer-to-peer Wi-Fi.       -->
+	<!-- iOS now gates ALL local network access behind this prompt.     -->
+	<!-- ============================================================= -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>SpatialMap connects directly to a nearby device to exchange sparse feature data peer-to-peer.</string>
+
+	<!-- ============================================================= -->
+	<!-- BONJOUR SERVICES (iOS 14+)                                     -->
+	<!-- You MUST declare every service type you advertise/browse,      -->
+	<!-- for BOTH the _tcp and _udp transports, or Multipeer silently   -->
+	<!-- fails to discover peers. The string here must match the        -->
+	<!-- serviceType used in MultipeerManager ("cv-spatial-map").       -->
+	<!-- ============================================================= -->
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_cv-spatial-map._tcp</string>
+		<string>_cv-spatial-map._udp</string>
+	</array>
+
+	<key>UILaunchScreen</key>
+	<dict/>
+</dict>
+</plist>
